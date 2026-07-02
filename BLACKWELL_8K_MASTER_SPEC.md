@@ -526,17 +526,28 @@ interruption costs at most one frame.
 
 ```bash
 sudo apt-get install -y openimageio-tools
-# Per-channel stats: a blank/black frame has avg≈0 & stddev≈0; a flat gray one has stddev≈0.
+# Human inspection of a master (per-channel Min/Max/Avg/StdDev, plus NaN/Inf counts):
 oiiotool --stats /mnt/nvme/jobs/<RUN_ID>/out/frame_0001.exr
-# Automated gate (tune 0.005 to your shot after the first good smoke frame):
-oiiotool --stats frame_0001.exr | awk '/Stats Avg/{a=$4} /Stats StdDev/{s=$4}
-         END{ exit !(a>0.001 && s>0.005) }' && echo FRAME_OK || echo FRAME_REJECTED
+
+# Automated gate — run it on the §7 Step-1 AgX-baked proof PNGs, NOT the multilayer EXRs
+# (the EXRs contain many passes, so naive whole-file stats are ambiguous). oiiotool also
+# prints "Constant: Yes" for any single-valued frame, which catches flat-gray failures that
+# a mean threshold alone would miss. Tune 0.005 after your first good smoke frame.
+# (Gate verified empirically: black frame -> REJECTED, flat gray -> REJECTED, real content -> OK.)
+oiiotool --stats frame_0001.png | awk '
+  /Stats Avg:/    {a=($3+$4+$5)/3}
+  /Stats StdDev:/ {s=($3+$4+$5)/3}
+  /^ *Constant: Yes/ {c=1}
+  END { exit !(a>0.001 && s>0.005 && !c) }' && echo FRAME_OK || echo FRAME_REJECTED
+
 # Frame-count gate for a range:
 [ "$(ls out/frame_*.exr | wc -l)" -eq "<EXPECTED>" ] && echo COUNT_OK
 ```
 
 The human proof PNG comes from the §7 Step-1 bake (AgX applied — a raw `oiiotool` linear→sRGB
 convert looks washed out by comparison and is fine only for blank-detection, not for judging look).
+Also check the EXR stats line `Stats NanCount` — any nonzero NaN count in the beauty pass means a
+broken frame even if the averages look sane.
 
 ### 10.6 Failure → cause → fix (the ones that actually happen)
 
