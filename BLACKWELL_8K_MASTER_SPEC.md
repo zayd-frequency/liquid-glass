@@ -12,6 +12,8 @@ fill-in table for those is at the very end.
 **How to read this document:** §§0–9 are the locked spec. Items marked **[FIX]** are corrections
 where a locked value, as written, fails against verified July-2026 AWS/Blender reality (each says
 why). §10 is the gap check: everything that was missing, added and marked. Nothing locked was removed.
+§11 is a second-pass audit run against §§0–10; every defect it found is fixed in place and marked
+**[FIX v2 — Issue N]**, and §10.8 (the unattended job runner) exists because of it.
 
 ---
 
@@ -25,22 +27,23 @@ why). §10 is the gap check: everything that was missing, added and marked. Noth
 | Denoiser | preview **OptiX** · final **OpenImageDenoise** + data passes |
 | Light bounces | total **12** (diffuse 4, glossy 4, transmission 8, **volume 4**, transparent 8) |
 | Clamp | direct 0 · **indirect 10** |
-| Volume | step rate **0.25** (hero) · max steps 1024 |
+| Volume | **unbiased integrator (5.0 default, committed)** — biased + step 0.25 / max steps 1024 only as the budget fallback (fix 1 below) |
 | Frame rate | **24 fps**, fixed seed 0 |
 | Output | **EXR multilayer, 16-bit half, DWAA** + PNG proof |
 | Colour | View Transform **AgX**, scene-linear |
 | Motion blur | ON, shutter **0.5** |
 | Delivery chain | **EXR sequence → ProRes 4444 master → H.265 MP4 share** |
-| Cost guard | max runtime **90 min**, idle cutoff **15 min**, auto-stop + budget alarm |
+| Cost guard | smoke/default ceiling **90 min** · hero ceiling **derived** (smoke time × frames × 1.5), idle cutoff **15 min**, auto-stop + budget alarm |
 
 **[FIX] Three locked values need one extra step each in Blender 5.0, or they silently do nothing / error out:**
 
-1. **Volume step rate & max steps** — Blender 5.0's new default volume algorithm (unbiased
-   null-scattering) **ignores** `Step Rate` and `Max Steps` entirely. To make the locked
-   0.25 / 1024 values take effect you must enable `Render > Volumes > Biased`
-   (`scene.cycles.volume_biased = True`). Alternatively, leave the new unbiased default on and skip
-   step tuning — it needs no step size and has no step banding. The §5 script sets `volume_biased`
-   so the locked numbers work as written.
+1. **Volume integrator — now committed [FIX v2 — Issue 6]:** the lock is Blender 5.0's **unbiased**
+   null-scattering integrator (`volume_biased = False`). It has no Step Rate / Max Steps knobs at
+   all — volume quality is governed by samples 4096 + adaptive threshold 0.005 + volume bounces 4.
+   The 0.25 / 1024 values survive only as the **budget fallback**: if the smoke-derived hero frame
+   time (§10.4) blows the per-frame budget, flip to `volume_biased = True` + step rate 0.25 / max
+   steps 1024 and knowingly trade a little bias for speed. One default, one documented escape
+   hatch — nothing contingent, nothing silent.
 2. **EXR multilayer** — in 5.0 you must set `image_settings.media_type = 'MULTI_LAYER_IMAGE'`
    **before** `file_format = 'OPEN_EXR_MULTILAYER'`, or Python raises an enum error (official 5.0
    API breaking change). The §5 script does this.
@@ -80,6 +83,13 @@ cache must always travel with the `.blend`** (S3 upload, worker copy, handoff) �
 5. Add-on limits: engines = Cycles CPU / Cycles GPU (OptiX) / EEVEE only; mesh conversion makes no cut
    surfaces (plan for volume rendering). **Headless:** author + import + **save cache** interactively
    once, then render the saved `.blend`+cache headless — don't script the modal import.
+   **[FIX v2 — Issue 4]** That boundary is now explicit, not implied: **authoring (data → cache) is
+   a one-time, local, manual pre-step; ONLY rendering is farmed.** The farm job's input contract is
+   `.blend` + cache staged in `jobs/<RUN_ID>/in/`, and the §10.8 runner **fails fast** (exit 66,
+   clear message) when the cache is missing — it never attempts an import on the worker. If the
+   add-on exposes importable Python APIs for building layers + saving the cache, prove them
+   headless on ONE box before relying on them; until proven, do not promise an unattended
+   data→cache build.
 
 ---
 
@@ -107,11 +117,11 @@ cache must always travel with the `.blend`** (S3 upload, worker copy, handoff) �
 - `Light Tree` **ON**. Caustics **OFF** unless you have glass/liquid. Fast GI **OFF**.
 
 **Volume**
-- `Render > Volumes > Step Rate (Render)` **0.25** (hero) / 0.6 (preview). Max Steps **1024**.
-  **[FIX]** In 5.0 these two settings only exist under **`Render > Volumes > Biased` = ON**
-  (`scene.cycles.volume_biased = True`); the new default unbiased algorithm has no step controls at
-  all. Either enable Biased so the locked values apply (what §5 does), or stay unbiased and treat
-  volume quality as governed purely by samples/threshold.
+- **[FIX v2 — Issue 6]** Committed: **unbiased integrator** (5.0 default, `Render > Volumes >
+  Biased` OFF) — it has no Step Rate / Max Steps controls; volume quality is governed by samples +
+  adaptive threshold + volume bounces. Fallback **only** on a blown frame-time budget:
+  `Biased` ON, Step Rate **0.25** (hero) / 0.6 (preview), Max Steps **1024** — carried in the §5
+  script as a commented block, not a live setting.
 - The volume grid **detail/resample** is the real VRAM driver at 8K — raise only as far as VRAM allows.
 
 **Output / colour**
@@ -150,7 +160,9 @@ cache must always travel with the `.blend`** (S3 upload, worker copy, handoff) �
   **[FIX]** "OptiX-capable Blackwell" on AWS means **G7e** (NVIDIA **RTX PRO 6000 Blackwell Server
   Edition**, 96 GB, 4th-gen RT cores — GA Jan 2026), starting at **g7e.2xlarge** (1 GPU, 8 vCPU,
   64 GiB RAM, 1.9 TB NVMe, ≈ $3.36/hr on-demand us-east-1, spot ≈ $1.67/hr). It is plain
-  On-Demand/Spot — no Capacity Blocks. Do **not** use P6 (B200/B300) for rendering: B200 has **no RT
+  On-Demand/Spot — no Capacity Blocks. Any single-GPU G7e size qualifies: if you already have a
+  certified **g7e.4xlarge**, keep it — same single 96 GB GPU, more vCPU/RAM for encode and CPU
+  fallbacks. Do **not** use P6 (B200/B300) for rendering: B200 has **no RT
   cores** (Blender Open Data: B200 median ≈ 8,311 vs ≈ 16,740 for RTX PRO 6000 Blackwell), the only
   size is 8-GPU `p6-b200.48xlarge` at ≈ $114/hr, and P-family quota/capacity is the hardest to get —
   ~34× the cost to render *slower per GPU*. Full decision table in §10.1.
@@ -172,8 +184,9 @@ cache must always travel with the `.blend`** (S3 upload, worker copy, handoff) �
 - **[FIX]** Three driver facts that break Blackwell boxes if missed:
   1. On Linux, Blackwell GPUs work **only with NVIDIA's open kernel modules** — the proprietary
      kernel module reports "No devices were found."
-  2. RTX PRO 6000 Blackwell needs an **R575+ driver branch** (some R570 builds don't recognize the
-     Server Edition). Blackwell baseline is R570+/CUDA 12.8.
+  2. **[FIX v2 — Issue 9]** One driver floor, stated once: **R575+** — the RTX PRO 6000 Server
+     Edition requirement, which subsumes every other Blackwell minimum. The DLAMI below ships
+     595.x, which clears it; pin that AMI and stop reasoning about driver branches.
   3. OptiX needs **`libnvoptix.so.1`**, which ships with the *graphics* driver package
      (`libnvidia-gl-<ver>`), **not** with compute-only "headless" driver installs — the #1 cause of
      `OPTIX_ERROR_LIBRARY_NOT_FOUND` on servers (in containers, set
@@ -225,14 +238,21 @@ cache must always travel with the `.blend`** (S3 upload, worker copy, handoff) �
 
 **Cost / shutdown (the most expensive mistake is a forgotten box)**
 - Hard cost ceiling `$<CEILING>`; **AWS Budgets alarm at 80%**.
-- **Max runtime 90 min**, **idle cutoff 15 min** (no `blender`/`cycles` process).
+- **Max runtime**: 90 min is the **smoke/default** ceiling only. **[FIX v2 — Issue 3]** A fixed
+  90 min cannot cover an 8K/4096 volume hero, let alone a sequence — derive the real per-box
+  ceiling from the smoke: measured minutes-per-frame × frames-on-this-box × 1.5 (§10.4).
+  **Idle cutoff 15 min** (no `blender`/`cycles` process).
 - Auto-stop: an on-box **watchdog** *and* an **EventBridge scheduled stop** as backstop.
 - **user-data boot script** does it hands-free: pull job → render range → upload → verify → **stop the
   instance**. Retry a failed frame once, then flag.
-- **[FIX]** For `sudo shutdown -h +90` to work as a true dead-man switch, launch with
-  `--instance-initiated-shutdown-behavior terminate` — the EBS-backed default is **stop**, and a
-  stopped instance **keeps billing for its EBS volumes** (a forgotten 300 GB gp3 ≈ $24/month).
-  Terminate-on-shutdown + delete-on-termination = a box that fully self-destructs. Scripts in §10.6.
+- **[FIX + FIX v2 — Issue 2]** For `sudo shutdown -h +N` to work as a true dead-man switch, launch
+  with `--instance-initiated-shutdown-behavior terminate` — the EBS-backed default is **stop**, and
+  a stopped instance **keeps billing for its EBS volumes** (a forgotten 300 GB gp3 ≈ $24/month).
+  But terminate is a **cattle setting**: it applies ONLY to disposable workers spawned from the
+  finished golden AMI. The **AMI-seed box is a pet** — launch it with `stop` and arm no dead-man
+  switch on it, so nothing can destroy it before the AMI exists. An already-certified,
+  hand-configured box you have no AMI of yet is a seed box: keep it `stop` + fail-closed until its
+  AMI is baked. Both launch profiles are in §10.3; watchdog scripts in §10.4.
 
 ---
 
@@ -260,7 +280,13 @@ Any of 1–7 fails → **stop the box** and fix.
 ```bash
 ldconfig -p | grep -q libnvoptix.so.1 && echo OPTIX_LIB_OK        # 8 OptiX driver lib present (headless installs often lack it)
 nvidia-smi --query-gpu=driver_version --format=csv,noheader       # 9 driver branch — must be 575+ on G7e (RTX PRO 6000)
-blender -b --python-expr "import bpy" -- --cycles-device OPTIX; echo "exit=$?"   # 10 fail-fast: exits 1 if OptiX device truly unusable
+
+# 10 fail-fast OptiX proof — [FIX v2 — Issue 1] the previous "import bpy" form never rendered, so
+#    it proved nothing: --cycles-device only takes effect when a render actually runs. Render a
+#    tiny frame of the default scene; the proof is exit 0 AND a non-empty file on disk.
+blender -b --python-expr "import bpy; s=bpy.context.scene; s.render.engine='CYCLES'; s.cycles.device='GPU'; s.render.resolution_x=64; s.render.resolution_y=64; s.render.resolution_percentage=100; s.cycles.samples=8" \
+        -o /tmp/optix_probe_#### -f 1 -- --cycles-device OPTIX \
+  && test -s /tmp/optix_probe_0001.png && echo OPTIX_RENDER_OK
 ```
 
 Proof 5 note: extensions register as `bl_ext.<repo>.<id>` (e.g. `bl_ext.user_default....`), so the
@@ -273,6 +299,20 @@ Blender preferences enabled it (prefs live in `~/.config/blender/5.0/`).
 
 ```python
 import bpy
+
+# [FIX v2 — Issue 5] Pin ONE exact build and refuse anything else. The [FIX]es below are verified
+# on 5.0.1; if your certified box runs a different build (e.g. 5.1.0), change THIS tuple, re-run
+# the §4 proofs + one smoke on that build, and the pin guarantees the whole fleet matches it.
+PINNED = (5, 0, 1)
+assert bpy.app.version == PINNED, \
+    f"Blender {bpy.app.version} != pinned {PINNED} — refusing to render on an unverified build"
+
+def lock(obj, name, val):
+    # [FIX v2 — Issue 7] loud failure at second 1 instead of a silent no-op after hours of setup
+    if not hasattr(obj, name):
+        raise AttributeError(f"{type(obj).__name__}.{name} missing on this build — fix before rendering")
+    setattr(obj, name, val)
+
 S = bpy.context.scene
 P = bpy.context.preferences.addons['cycles'].preferences
 P.compute_device_type = 'OPTIX'; P.refresh_devices()
@@ -282,20 +322,24 @@ S.render.resolution_x, S.render.resolution_y, S.render.resolution_percentage = 7
 S.cycles.samples = 4096
 S.cycles.use_adaptive_sampling = True; S.cycles.adaptive_threshold = 0.005
 S.cycles.use_denoising = True; S.cycles.denoiser = 'OPENIMAGEDENOISE'
-S.cycles.denoising_input_passes = 'RGB_ALBEDO_NORMAL'
-S.cycles.denoising_use_gpu = True                        # [ADDED] OIDN on the GPU, not 8 vCPUs
+lock(S.cycles, 'denoising_input_passes', 'RGB_ALBEDO_NORMAL')
+lock(S.cycles, 'denoising_use_gpu', True)                # [ADDED] OIDN on the GPU, not 8 vCPUs
 S.render.use_persistent_data = True
+S.render.use_overwrite = False                           # [ADDED] farm resume: skip frames already on disk
+S.render.use_placeholder = True                          # [ADDED] placeholder stops two boxes racing one frame
 S.cycles.max_bounces = 12; S.cycles.diffuse_bounces = 4; S.cycles.glossy_bounces = 4
 S.cycles.transmission_bounces = 8; S.cycles.volume_bounces = 4; S.cycles.transparent_max_bounces = 8
 S.cycles.sample_clamp_indirect = 10.0; S.cycles.sample_clamp_direct = 0.0
 S.cycles.use_light_tree = True
-S.cycles.volume_biased = True                            # [FIX] 5.0: step settings are ignored without this
-S.cycles.volume_step_rate = 0.25; S.cycles.volume_max_steps = 1024
+lock(S.cycles, 'volume_biased', False)   # [FIX v2 — Issue 6] committed: unbiased integrator (no step knobs)
+# Budget fallback ONLY — flip all three together when the smoke-derived hero frame time is over budget:
+# lock(S.cycles, 'volume_biased', True)
+# S.cycles.volume_step_rate = 0.25; S.cycles.volume_max_steps = 1024
 S.cycles.seed = 0
 S.render.use_motion_blur = True; S.render.motion_blur_shutter = 0.5
 S.render.fps = 24
 S.view_settings.view_transform = 'AgX'
-S.render.image_settings.media_type = 'MULTI_LAYER_IMAGE' # [FIX] 5.0: must be set BEFORE file_format
+lock(S.render.image_settings, 'media_type', 'MULTI_LAYER_IMAGE')  # [FIX] 5.0: BEFORE file_format
 S.render.image_settings.file_format = 'OPEN_EXR_MULTILAYER'
 S.render.image_settings.color_depth = '16'; S.render.image_settings.exr_codec = 'DWAA'
 used = [d.name for d in P.devices if d.use]; print("GPU DEVICES USED:", used)
@@ -376,9 +420,12 @@ ffmpeg -i master.mov -c:v libx265 -crf 18 -pix_fmt yuv420p10le -tag:v hvc1 share
 | `<SECONDS>` / `<CAMERA_MOVE>` | animation length + the exact camera move |
 
 **[ADDED] Recommended values** (verified July 2026, us-east-1): `<INSTANCE_TYPE>` = **g7e.2xlarge**
-(1× RTX PRO 6000 Blackwell 96 GB, 1.9 TB NVMe), `<COST_HR>` ≈ **$3.36** on-demand / ≈ $1.67 spot,
-`<REGION>` = **us-east-1**, `<AMI_ID>` = Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 24.04)
-resolved via its SSM parameter (§10.5), Blender pinned to **5.0.1**.
+(1× RTX PRO 6000 Blackwell 96 GB, 1.9 TB NVMe) — or an already-certified **g7e.4xlarge** (same
+single GPU); `<COST_HR>` ≈ **$3.36** on-demand / ≈ $1.67 spot, `<REGION>` = **us-east-1**,
+`<AMI_ID>` = Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 24.04) resolved via its SSM
+parameter (§10.3), Blender pinned to **the exact build your certified box runs** — 5.0.1 is this
+doc's verified baseline; if the box runs 5.1.0, set `PINNED = (5, 1, 0)` in §5 and re-run the §4
+proofs + one smoke to revalidate the 5.0-era fixes on it (**[FIX v2 — Issue 5]**).
 
 ---
 
@@ -388,15 +435,19 @@ resolved via its SSM parameter (§10.5), Blender pinned to **5.0.1**.
 3. 8K EXR (16-bit half, DWAA) + PNG proof; **AgX**.
 4. Samples 4096, adaptive 0.005, **OpenImageDenoise + data passes**, Persistent Data on.
 5. Bounces total 12 (volume 4), clamp indirect 10, Light Tree on.
-6. Volume step-rate 0.25; watch VRAM, quadrant-tile if needed; smoke at 1080p first.
+6. Volume: unbiased integrator committed (biased 0.25/1024 only as the budget fallback); watch
+   VRAM, quadrant-tile if needed; smoke at 1080p first.
 7. 24 fps, camera-moves-subject-stays, motion blur 0.5; render an **EXR sequence** (never straight to video).
 8. AWS: golden AMI, seven proofs, `nvidia-smi pmon` shows blender on GPU, reject gray frames.
 9. IAM least-privilege, SSM, IMDSv2, same-region bucket, disk ≥ 2× job.
 10. Budget alarm + max-runtime 90 + idle 15 + auto-stop; resume skips done frames; encode EXR→ProRes→MP4.
 11. **[ADDED]** G7e (RTX PRO 6000, 96 GB, RT cores) not P6/B200; driver **R575+ open kernel modules**;
     `libnvoptix.so.1` present (proof 8); quota **L-DB2E81BA ≥ 8 vCPUs** approved before render day.
-12. **[ADDED]** 5.0 specifics honored: `volume_biased=True` before step-rate, `media_type` before
-    `file_format`, GPU OIDN on, view transform **baked before encoding** video.
+12. **[ADDED]** 5.0 specifics honored: volume mode committed and guarded, `media_type` before
+    `file_format`, GPU OIDN on, exact-build pin asserted at render start, view transform **baked
+    before encoding** video.
+13. **[FIX v2]** Proof 10 actually renders; seed box = stop/pet, workers = terminate/cattle; hero
+    ceiling derived from the smoke; the run is one unattended §10.8 job, never hand-driven.
 
 ---
 
@@ -472,14 +523,44 @@ aws service-quotas request-service-quota-increase --service-code ec2 \
 aws ssm get-parameter --region us-east-1 --query 'Parameter.Value' --output text --name \
   /aws/service/deeplearning/ami/x86_64/base-oss-nvidia-driver-gpu-ubuntu-24.04/latest/ami-id
 
-# Launch: IMDSv2 enforced, self-destruct on OS shutdown, disk deleted with the box, tagged
+# [FIX v2 — Issue 2] TWO launch profiles. The AMI-seed box is a PET (stop, no dead-man switch) —
+# you must not be able to lose it before the golden AMI exists. Workers are CATTLE (terminate +
+# delete-on-termination), spawned only FROM the finished AMI.
+
+# (a) SEED box — bootstrap per §10.2, bake the golden AMI from it, then stop it manually
 aws ec2 run-instances --region us-east-1 \
-  --instance-type g7e.2xlarge --image-id <AMI_ID> \
+  --instance-type g7e.2xlarge --image-id <DLAMI_ID> \
+  --iam-instance-profile Name=<RENDER_PROFILE> \
+  --metadata-options "HttpTokens=required,HttpEndpoint=enabled,HttpPutResponseHopLimit=2" \
+  --instance-initiated-shutdown-behavior stop \
+  --block-device-mappings 'DeviceName=/dev/sda1,Ebs={VolumeSize=300,VolumeType=gp3,Throughput=250,DeleteOnTermination=true}' \
+  --tag-specifications 'ResourceType=instance,Tags=[{Key=project,Value=<RUN_ID>},{Key=role,Value=ami-seed}]'
+
+# (b) On-Demand WORKER — from the golden AMI; OS shutdown fully destroys it (dead-man safe)
+aws ec2 run-instances --region us-east-1 \
+  --instance-type g7e.2xlarge --image-id <GOLDEN_AMI_ID> \
   --iam-instance-profile Name=<RENDER_PROFILE> \
   --metadata-options "HttpTokens=required,HttpEndpoint=enabled,HttpPutResponseHopLimit=2" \
   --instance-initiated-shutdown-behavior terminate \
   --block-device-mappings 'DeviceName=/dev/sda1,Ebs={VolumeSize=300,VolumeType=gp3,Throughput=250,DeleteOnTermination=true}' \
-  --tag-specifications 'ResourceType=instance,Tags=[{Key=project,Value=<RUN_ID>},{Key=auto-stop,Value=true}]'
+  --tag-specifications 'ResourceType=instance,Tags=[{Key=project,Value=<RUN_ID>},{Key=role,Value=worker}]'
+
+# (c) SPOT worker — [FIX v2 — Issue 8] the Spot design §3 promises, actually configured:
+# interruption-behavior=stop preserves the box for resume, use_overwrite=False (§5) skips finished
+# frames on restart, and shutdown-behavior stays stop (terminate would defeat resume). The
+# dead-man switch is the cost backstop. After delivery, CLEAN UP explicitly — a stopped spot box
+# still bills EBS: cancel the spot request, then terminate the instance.
+aws ec2 run-instances --region us-east-1 \
+  --instance-type g7e.2xlarge --image-id <GOLDEN_AMI_ID> \
+  --iam-instance-profile Name=<RENDER_PROFILE> \
+  --metadata-options "HttpTokens=required,HttpEndpoint=enabled,HttpPutResponseHopLimit=2" \
+  --instance-initiated-shutdown-behavior stop \
+  --instance-market-options 'MarketType=spot,SpotOptions={SpotInstanceType=persistent,InstanceInterruptionBehavior=stop}' \
+  --block-device-mappings 'DeviceName=/dev/sda1,Ebs={VolumeSize=300,VolumeType=gp3,Throughput=250,DeleteOnTermination=true}' \
+  --tag-specifications 'ResourceType=instance,Tags=[{Key=project,Value=<RUN_ID>},{Key=role,Value=spot-worker}]'
+# cleanup after the job:
+#   aws ec2 cancel-spot-instance-requests --spot-instance-request-ids <SIR_ID>
+#   aws ec2 terminate-instances --instance-ids <IID>
 ```
 
 Instance-profile policy — note the bucket-ARN / object-ARN split (the classic `AccessDenied` fix):
@@ -500,9 +581,12 @@ Instance-profile policy — note the bucket-ARN / object-ARN split (the classic 
 ### 10.4 Dead-man switch + idle watchdog (the always-on cost guard, concrete)
 
 ```bash
-# At job start — hard ceiling. With shutdown-behavior=terminate (§10.3) this DESTROYS the box
-# at T+90 min no matter what hangs. Re-arm with more time for longer batches; cancel: shutdown -c
-sudo shutdown -h +90 "render dead-man switch"
+# At job start — hard ceiling. [FIX v2 — Issue 3] 90 is the SMOKE/default ceiling only. For the
+# hero job DERIVE it: CEILING_MIN = smoke-measured minutes/frame × frames-on-this-box × 1.5.
+# [FIX v2 — Issue 2] NEVER arm this on the AMI-seed box (§10.3a) — workers only: on (b) workers
+# shutdown = terminate (box destroyed), on (c) spot workers shutdown = stop (resumable).
+# Cancel: shutdown -c
+sudo shutdown -h +<CEILING_MIN> "render dead-man switch"
 
 # Idle watchdog — every minute; 15 consecutive minutes with no blender/cycles process => shutdown
 cat <<'EOF' | sudo tee /usr/local/bin/render-watchdog.sh >/dev/null
@@ -562,8 +646,13 @@ broken frame even if the averages look sane.
 | `AccessDenied` on `aws s3 sync` | ListBucket vs GetObject on the wrong ARN | §10.3 policy: bucket ARN for List, `/jobs/*` ARN for Get/Put |
 | Proof 1 curl hangs forever | IMDSv1 call on an IMDSv2-only box | §4 [FIX]: token flow |
 | Video master looks flat/washed out | linear EXR encoded without the AgX view transform | §7 [FIX]: bake with Blender first, then ffmpeg |
-| Step Rate/Max Steps tweaks change nothing | Blender 5.0 unbiased volumes ignore them | §5 [FIX]: `volume_biased = True` |
+| Step Rate/Max Steps tweaks change nothing | expected — the committed unbiased integrator has no step knobs | only meaningful in the biased budget-fallback (§0 fix 1, §5 commented block) |
 | Python error setting `OPEN_EXR_MULTILAYER` | 5.0 media_type gate | §5 [FIX]: set `media_type='MULTI_LAYER_IMAGE'` first |
+| "OptiX passed proofs" but render ran on CPU | old proof 10 never rendered, so it validated nothing | §4 proof 10 [FIX v2 — Issue 1]: render a tiny frame, require exit 0 + non-empty file |
+| Bootstrap box vanished before the AMI was baked | terminate + dead-man switch armed on the seed box | §10.3a [FIX v2 — Issue 2]: seed = stop, no dead-man; terminate is workers-only |
+| Box auto-stopped mid-hero with no frame out | fixed 90-min ceiling < one 8K/4096 volume frame | §10.4 [FIX v2 — Issue 3]: derive the ceiling from the smoke |
+| Run never finishes across sessions | job hand-driven over SSM through interruptions | §10.8: one unattended runner — finishes or fails with a postmortem |
+| Spot batch can't resume after interruption | terminate behavior / no Spot request config | §10.3c [FIX v2 — Issue 8]: interruption-behavior=stop + `use_overwrite=False` |
 | OOM at 8K | volume grid too dense for VRAM | 96 GB G7e headroom; else lower resample, or quadrant render-regions (§2) |
 | Box gone but bill keeps growing | instance *stopped*, EBS still billing | terminate-on-shutdown + delete-on-termination (§10.3); check `aws ec2 describe-instances` |
 
@@ -572,8 +661,9 @@ broken frame even if the averages look sane.
 1. Request quota (§10.3) → wait for approval. Create bucket + IAM role. Set the Budgets alarm.
 2. Author interactively: import volume data, build node chain, **save cache**, save `.blend` (§1).
 3. `aws s3 sync` the job to `s3://<BUCKET>/jobs/<RUN_ID>/in/`.
-4. Launch one g7e.2xlarge (§10.3). Bootstrap or use the golden AMI (§10.2). Arm the dead-man
-   switch + watchdog (§10.4).
+4. Launch the **seed box** with profile (a) (§10.3 — stop behavior, **no dead-man switch**).
+   Bootstrap it (§10.2), bake the golden AMI, stop the seed. Launch one **worker** from the AMI
+   with profile (b); the worker arms its own dead-man switch + watchdog (§10.4).
 5. Run proofs 1–10 (§4). Any failure → terminate, fix, relaunch.
 6. Sync the job down to `/mnt/nvme`. **Smoke: one 1920×1080 frame** of the exact scene
    (`-o .../smoke_####` and override resolution via a 2-line `-P` snippet or a preview copy of
@@ -585,3 +675,184 @@ broken frame even if the averages look sane.
 10. Only after this single box passes end-to-end: fan out N boxes with non-overlapping `-s/-e`
     ranges, each with its own watchdog and dead-man switch. Batch starts on an explicit go — never
     automatically.
+
+**[FIX v2 — orchestration]** Steps 5–9 must run as **one unattended script on the box** (§10.8) —
+never hand-driven over SSM turn by turn. A hand-driven run dies with every chat/session/SSM-window
+interruption; the unattended job either finishes or fails cleanly with a postmortem in S3, no
+matter what happens to the operator.
+
+### 10.8 The unattended job runner (`run_job.sh`) — a run finishes or explains itself
+
+One script, started once (user-data, SSM one-shot, or `nohup ... &`), owning the whole job. It
+assumes the §1.4/§1.5 input contract: the `.blend` **and its saved cache** are already staged under
+`jobs/<RUN_ID>/in/` — it never attempts the GUI import.
+
+```bash
+#!/usr/bin/env bash
+set -Eeuo pipefail
+RUN_ID=<RUN_ID>; BUCKET=<BUCKET>
+SCRATCH=/mnt/nvme/jobs/$RUN_ID; LOG=$SCRATCH/run.log
+mkdir -p "$SCRATCH/out"; exec > >(tee -a "$LOG") 2>&1
+
+postmortem() {                                   # runs on EVERY exit path — success or death
+  code=$?
+  aws s3 cp "$LOG" "s3://$BUCKET/jobs/$RUN_ID/postmortem/run.log" || true
+  printf '{"exit":%d,"stage":"%s","ts":"%s"}\n' "$code" "${STAGE:-unknown}" "$(date -u +%FT%TZ)" \
+    | aws s3 cp - "s3://$BUCKET/jobs/$RUN_ID/postmortem/status.json" || true
+  sudo shutdown -h +2 "job ended (exit $code, stage ${STAGE:-unknown}) - self stop"
+}
+trap postmortem EXIT
+
+STAGE=deadman   # ceiling derived per §10.4 — smoke min/frame × frames × 1.5. Workers only, never the seed box.
+sudo shutdown -h +<CEILING_MIN> "render dead-man switch"
+
+STAGE=pull
+aws s3 sync "s3://$BUCKET/jobs/$RUN_ID/in/"  "$SCRATCH/in/"
+aws s3 sync "s3://$BUCKET/jobs/$RUN_ID/out/" "$SCRATCH/out/"   # resume: pre-seed finished frames
+
+STAGE=inputs    # fail-closed input contract — never render toward an empty volume
+test -s "$SCRATCH/in/scene.blend"
+[ -d "$SCRATCH/in/<CACHE_DIR>" ] && [ -n "$(ls -A "$SCRATCH/in/<CACHE_DIR>")" ] \
+  || { echo "FATAL: volume cache missing — author it locally (§1.4) and re-stage"; exit 66; }
+
+STAGE=proofs    # §4 proofs 2-10 scripted; each failure aborts here, before any GPU-hour is spent
+nvidia-smi >/dev/null
+ldconfig -p | grep -q libnvoptix.so.1
+blender -b --python-expr "import bpy; s=bpy.context.scene; s.render.engine='CYCLES'; s.cycles.device='GPU'; s.render.resolution_x=64; s.render.resolution_y=64; s.cycles.samples=8" \
+        -o /tmp/optix_probe_#### -f 1 -- --cycles-device OPTIX
+test -s /tmp/optix_probe_0001.png
+
+STAGE=smoke     # one 1080p frame of the real scene + the §10.5 numeric gate
+blender -b "$SCRATCH/in/scene.blend" -P render_smoke.py \
+        -o "$SCRATCH/out/smoke_####" -f <MID_FRAME> -- --cycles-device OPTIX
+# (render_smoke.py = render_8k.py with 1920×1080 + preview samples; §10.5 gate on the baked proof)
+
+STAGE=hero
+blender -b "$SCRATCH/in/scene.blend" -P render_8k.py \
+        -o "$SCRATCH/out/frame_####" -s <START> -e <END> -a \
+        -- --cycles-device OPTIX --cycles-print-stats
+
+STAGE=validate  # §10.5: count gate + per-frame numeric gate + NaN check; any failure exits here
+[ "$(ls "$SCRATCH"/out/frame_*.exr | wc -l)" -eq <EXPECTED> ]
+
+STAGE=upload
+( cd "$SCRATCH/out" && sha256sum * > checksums.sha256 )
+aws s3 sync "$SCRATCH/out/" "s3://$BUCKET/jobs/$RUN_ID/out/"
+
+STAGE=done; echo "JOB COMPLETE"
+```
+
+Properties that end the never-finishes loop: **fail-closed** (missing cache exits 66 before any
+render), **resumable** (out/ pre-seed + §5 `use_overwrite=False` skip already-finished frames, so
+an interrupted box relaunches and continues), **self-terminating** (the EXIT trap stops the box on
+every path — the shutdown behavior chosen at launch decides stop vs destroy), and **evidenced**
+(log + stage + exit code land in `postmortem/` even on death, so a failed run tells you why without
+a live SSM session).
+
+---
+
+## 11. Second-pass audit — defects in the spec itself
+*Same review method as §10, run on §§0–10. Terminology kept as the doc uses it ("volume data",
+"the volume add-on"). Ranked worst first. Each: what's wrong → why it fails → fix. Every issue
+below is now fixed in place in §§0–10 and marked `[FIX v2 — Issue N]`; the resolution pointer
+follows each entry.*
+
+**[ISSUE 1 — FALSE PROOF] Proof 10 does not actually test OptiX (§4).**
+`blender -b --python-expr "import bpy" -- --cycles-device OPTIX; echo "exit=$?"` never renders, so
+Cycles never creates a device session — `--cycles-device` only takes effect when a render runs. On a
+box where OptiX is fully broken this still exits **0**. The proof that's supposed to be the fail-fast
+catch is the one proof that can't catch anything.
+→ Fix: make it render one tiny frame and check exit≠0 AND that a non-zero-byte frame landed.
+**Resolved:** §4 proof 10 now renders a 64×64/8-spp frame of the default scene and requires exit 0
+plus a non-empty `/tmp/optix_probe_0001.png`; §10.8 runs the same probe in its `proofs` stage.
+
+**[ISSUE 2 — SELF-DESTRUCT ORDERING] terminate-on-shutdown was applied to the box you haven't baked
+yet (§10.3 + §10.4 + §10.7).**
+Launching every box with `--instance-initiated-shutdown-behavior terminate` plus a `shutdown -h +90`
+dead-man switch meant the FIRST box — the one the golden AMI is baked from — could destroy itself
+before the AMI existed.
+→ Fix: bake the AMI on a box launched `shutdown-behavior=stop`; `terminate` ONLY for disposable
+workers spawned from the finished AMI. terminate is a cattle setting; the AMI-seed box is a pet.
+**Resolved:** §10.3 now has explicit seed (a) / worker (b) / spot-worker (c) launch profiles; §10.4
+and §10.7 step 4 forbid arming the dead-man switch on the seed; §3 states the pet/cattle rule.
+An already-certified hand-built box with no AMI yet is a **seed** — keep it stop + fail-closed.
+
+**[ISSUE 3 — TWO LOCKED VALUES THAT CONTRADICT] "max runtime 90 min" cannot coexist with "8K @ 4096
+samples" for volume content (§0).**
+A single 33-MP frame at 4096 samples with volume bounces can outrun 90 min on one GPU; a 24 fps
+animation is orders of magnitude beyond it.
+→ Fix: 90 min is a *smoke/default* ceiling. Derive the real per-box runtime from the 1080p smoke's
+measured per-frame time × frames-per-box × ~1.5, set per job.
+**Resolved:** §0 table, §3 cost guard, §10.4, and §10.8 all now use the derived `<CEILING_MIN>`;
+90 min remains only as the smoke/default value.
+
+**[ISSUE 4 — NOT ACTUALLY HEADLESS] The farm requires a manual GUI step it never removes (§1.5,
+§10.7 step 2).**
+Cache creation is "author + import + save cache interactively once" with no headless path offered —
+the exact step that must be automated for a farm was left to a human at a GUI, silently.
+→ Fix: (a) prove a headless cache build via the add-on's lower-level APIs, or (b) state plainly that
+authoring is a one-time manual pre-step done locally and ONLY rendering is farmed.
+**Resolved (as (b), honestly):** §1.5 now states the boundary explicitly — data→cache is a local,
+manual, one-time pre-step; the farmed unit is render-only with `.blend`+cache as the input contract,
+and §10.8 fails fast (exit 66) if the cache is missing rather than limping into an empty render.
+Path (a) remains open: if the add-on's Python API can build layers + save the cache, prove it
+headless on ONE box before promising it — until then this spec does not.
+
+**[ISSUE 5 — VERSION PIN vs FIXES] Pins Blender 5.0.1, but every [FIX] is 5.0-API-specific and the
+pin reasoning was backwards (§2, §5, §7).**
+"Not an LTS series, so standardize on 5.0.1" is a non-sequitur, and a worker on a different minor
+makes `media_type`, `volume_biased`, and the AgX name behave unpredictably.
+→ Fix: pin ONE exact build and hard-assert `bpy.app.version` before rendering.
+**Resolved:** §5 now opens with `PINNED = (5, 0, 1)` + a refusing assert; §8 says the pin is
+*whatever exact build your certified box runs* (e.g. `(5, 1, 0)`) — change the tuple once, re-run
+the §4 proofs + one smoke on that build, and the fleet is guaranteed uniform.
+
+**[ISSUE 6 — "LOCKED" VALUE THAT ISN'T] The step-rate/biased volume default contradicted itself
+(§0, §2, §5).**
+§0 locked step rate 0.25/1024 while §2/§5 admitted the unbiased default makes them optional — a
+contingent value presented as locked, and forcing `volume_biased=True` opted out of the newer path.
+→ Fix: commit to one.
+**Resolved:** committed to **unbiased** (§0 fix 1, §2, §5): no step knobs, quality governed by
+samples/threshold/bounces. Biased + 0.25/1024 survives only as the explicit budget fallback with a
+stated trigger (smoke-derived frame time over budget), carried as a commented block in §5.
+
+**[ISSUE 7 — SILENT-FAIL RISK] API properties asserted as working, with no runtime guard (§5).**
+`denoising_use_gpu`, `denoising_input_passes`, and the `media_type` gate could silently no-op or
+raise late on a slightly different build.
+→ Fix: wrap each in an explicit guard that aborts loud at second 1.
+**Resolved:** §5 adds `lock()` — a hasattr-guarded setter that raises immediately — applied to
+every 5.0-specific property, alongside the version assert from Issue 5.
+
+**[ISSUE 8 — SPOT IS RECOMMENDED BUT NEVER CONFIGURED] (§3 vs §10.3).**
+§3 recommended Spot-with-stop for batches, but the only launch template was On-Demand with
+`terminate` everywhere — no Spot request config existed, and terminate clashes with stop-to-resume.
+→ Fix: add the actual Spot request block and reconcile behaviors.
+**Resolved:** §10.3 profile (c): `--instance-market-options
+'MarketType=spot,SpotOptions={SpotInstanceType=persistent,InstanceInterruptionBehavior=stop}'`,
+shutdown-behavior stop, resume via §5 `use_overwrite=False` + §10.8 out/ pre-seed, and an explicit
+post-job cleanup (cancel spot request, then terminate — a stopped spot box still bills EBS).
+
+**[ISSUE 9 — FACTUAL WOBBLE] R575 vs R570 in the same breath (§3 [FIX] 2).**
+A driver floor that contradicts itself one line later sends someone chasing a phantom driver problem.
+→ Fix: state the real floor once.
+**Resolved:** §3 now states one floor — **R575+** (the RTX PRO 6000 SE requirement subsumes all
+other Blackwell minima) — and pins the DLAMI (595.x) as the way to never think about it again.
+
+### 11.1 Failure → cause → fix (the ones this spec would have caused)
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| "OptiX passed proofs" but render is on CPU | Proof 10 never rendered → validated nothing | Issue 1 → §4 proof 10 |
+| Bootstrap box vanished before the AMI was baked | terminate + dead-man switch on the seed box | Issue 2 → §10.3a |
+| Box auto-stopped mid-hero, no frame | 90-min ceiling < one 8K/4096 volume frame | Issue 3 → §10.4 derived ceiling |
+| "Automated farm" stalls waiting on a person | cache build is a manual GUI step | Issue 4 → §1.5 contract + §10.8 fail-fast |
+| A [FIX] does nothing on a worker | worker runs a different Blender minor | Issue 5 → §5 version assert |
+| Master looks wrong despite "locked" volume values | biased vs unbiased never committed | Issue 6 → committed unbiased |
+| Hours in, output flat/undenoised | a denoise property silently no-op'd | Issue 7 → §5 `lock()` |
+| Spot batch can't resume after interruption | terminate instead of stop; no Spot config | Issue 8 → §10.3c |
+
+### 11.2 Scope note — what this spec still does not do
+Two things remain deliberately out of scope, stated so nobody assumes otherwise:
+1. **Headless data→cache build.** The add-on's import is GUI-modal; until its Python API is proven
+   headless on a real box, authoring stays a local manual pre-step (Issue 4, path (a) open).
+2. **Preprocessing (raw data → clean volume).** This is a render/farm spec; cleaning, spacing, and
+   level normalization of the source volume happen before §1 and are not covered here.
