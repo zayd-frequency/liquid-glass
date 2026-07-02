@@ -14,6 +14,11 @@ where a locked value, as written, fails against verified July-2026 AWS/Blender r
 why). §10 is the gap check: everything that was missing, added and marked. Nothing locked was removed.
 §11 is a second-pass audit run against §§0–10; every defect it found is fixed in place and marked
 **[FIX v2 — Issue N]**, and §10.8 (the unattended job runner) exists because of it.
+**Companion document:** `VOLUME_LOOK_LAW.md` governs the *look* (measured-data-driven thresholds,
+ramps, opacity, lighting rig, quality tiers). This spec governs the pipeline. Where they overlap
+they agree, except two explicit overrides the law states in its §3: shots it governs use the
+**biased** volume integrator (its tiers need step-rate control) and an **85 mm hero lens** (50 mm
+stays the context lens).
 
 ---
 
@@ -43,7 +48,9 @@ why). §10 is the gap check: everything that was missing, added and marked. Noth
    The 0.25 / 1024 values survive only as the **budget fallback**: if the smoke-derived hero frame
    time (§10.4) blows the per-frame budget, flip to `volume_biased = True` + step rate 0.25 / max
    steps 1024 and knowingly trade a little bias for speed. One default, one documented escape
-   hatch — nothing contingent, nothing silent.
+   hatch — nothing contingent, nothing silent. (Shots governed by `VOLUME_LOOK_LAW.md` are a
+   *second committed choice*, not an exception: that law opts into the biased path deliberately
+   because its quality tiers use step rate as a knob — see its §3/§4.)
 2. **EXR multilayer** — in 5.0 you must set `image_settings.media_type = 'MULTI_LAYER_IMAGE'`
    **before** `file_format = 'OPEN_EXR_MULTILAYER'`, or Python raises an enum error (official 5.0
    API breaking change). The §5 script does this.
@@ -332,7 +339,9 @@ S.cycles.transmission_bounces = 8; S.cycles.volume_bounces = 4; S.cycles.transpa
 S.cycles.sample_clamp_indirect = 10.0; S.cycles.sample_clamp_direct = 0.0
 S.cycles.use_light_tree = True
 lock(S.cycles, 'volume_biased', False)   # [FIX v2 — Issue 6] committed: unbiased integrator (no step knobs)
-# Budget fallback ONLY — flip all three together when the smoke-derived hero frame time is over budget:
+# Flip all three together in exactly two cases: (1) budget fallback — the smoke-derived hero frame
+# time is over budget; (2) the shot is governed by VOLUME_LOOK_LAW.md, whose tiers require the
+# biased path (its hero tier: volume_bounces=16, step rate 0.15 — see that doc's §4):
 # lock(S.cycles, 'volume_biased', True)
 # S.cycles.volume_step_rate = 0.25; S.cycles.volume_max_steps = 1024
 S.cycles.seed = 0
