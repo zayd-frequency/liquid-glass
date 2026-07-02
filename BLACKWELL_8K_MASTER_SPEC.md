@@ -14,11 +14,13 @@ where a locked value, as written, fails against verified July-2026 AWS/Blender r
 why). §10 is the gap check: everything that was missing, added and marked. Nothing locked was removed.
 §11 is a second-pass audit run against §§0–10; every defect it found is fixed in place and marked
 **[FIX v2 — Issue N]**, and §10.8 (the unattended job runner) exists because of it.
-**Companion document:** `VOLUME_LOOK_LAW.md` governs the *look* (measured-data-driven thresholds,
+**Companion documents:** `VOLUME_LOOK_LAW.md` governs the *look* (measured-data-driven thresholds,
 ramps, opacity, lighting rig, quality tiers). This spec governs the pipeline. Where they overlap
 they agree, except two explicit overrides the law states in its §3: shots it governs use the
 **biased** volume integrator (its tiers need step-rate control) and an **85 mm hero lens** (50 mm
-stays the context lens).
+stays the context lens). `PATH_TO_100.md` is the closure plan: gap → deliverable → acceptance for
+everything between this spec and one proven unattended end-to-end run; its Part 1 + 4.1 runner
+gates are implemented in §10.8 below and marked `[P100 n.n]`.
 
 ---
 
@@ -592,6 +594,9 @@ Instance-profile policy — note the bucket-ARN / object-ARN split (the classic 
 ```bash
 # At job start — hard ceiling. [FIX v2 — Issue 3] 90 is the SMOKE/default ceiling only. For the
 # hero job DERIVE it: CEILING_MIN = smoke-measured minutes/frame × frames-on-this-box × 1.5.
+# [P100 1.3] The derived value doesn't exist until the smoke has run — so the §10.8 runner arms a
+# generous +180 default first, then `shutdown -c` + re-arms with the derived ceiling after the
+# smoke stage measures a frame. Manual runs should do the same two-step.
 # [FIX v2 — Issue 2] NEVER arm this on the AMI-seed box (§10.3a) — workers only: on (b) workers
 # shutdown = terminate (box destroyed), on (c) spot workers shutdown = stop (resumable).
 # Cancel: shutdown -c
@@ -700,20 +705,31 @@ assumes the §1.4/§1.5 input contract: the `.blend` **and its saved cache** are
 #!/usr/bin/env bash
 set -Eeuo pipefail
 RUN_ID=<RUN_ID>; BUCKET=<BUCKET>
+START=<START>; END=<END>; FRAMES=$(( END - START + 1 ))
 SCRATCH=/mnt/nvme/jobs/$RUN_ID; LOG=$SCRATCH/run.log
 mkdir -p "$SCRATCH/out"; exec > >(tee -a "$LOG") 2>&1
+
+gate_png() {   # the §10.5 numeric gate: mean>0.001, stddev>0.005, not constant-color
+  oiiotool --stats "$1" | awk '
+    /Stats Avg:/    {a=($3+$4+$5)/3}
+    /Stats StdDev:/ {s=($3+$4+$5)/3}
+    /^ *Constant: Yes/ {c=1}
+    END { exit !(a>0.001 && s>0.005 && !c) }'
+}
 
 postmortem() {                                   # runs on EVERY exit path — success or death
   code=$?
   aws s3 cp "$LOG" "s3://$BUCKET/jobs/$RUN_ID/postmortem/run.log" || true
+  aws s3 cp "$SCRATCH/gpu_telemetry.txt" "s3://$BUCKET/jobs/$RUN_ID/postmortem/gpu_telemetry.txt" 2>/dev/null || true
   printf '{"exit":%d,"stage":"%s","ts":"%s"}\n' "$code" "${STAGE:-unknown}" "$(date -u +%FT%TZ)" \
     | aws s3 cp - "s3://$BUCKET/jobs/$RUN_ID/postmortem/status.json" || true
   sudo shutdown -h +2 "job ended (exit $code, stage ${STAGE:-unknown}) - self stop"
 }
 trap postmortem EXIT
 
-STAGE=deadman   # ceiling derived per §10.4 — smoke min/frame × frames × 1.5. Workers only, never the seed box.
-sudo shutdown -h +<CEILING_MIN> "render dead-man switch"
+STAGE=deadman   # [P100 1.3] the derived ceiling can't exist before the smoke runs — arm a GENEROUS
+                # default now; the ceiling stage below replaces it. Workers only, never the seed box.
+sudo shutdown -h +180 "render dead-man switch (default — re-armed after smoke)"
 
 STAGE=pull
 aws s3 sync "s3://$BUCKET/jobs/$RUN_ID/in/"  "$SCRATCH/in/"
@@ -731,18 +747,55 @@ blender -b --python-expr "import bpy; s=bpy.context.scene; s.render.engine='CYCL
         -o /tmp/optix_probe_#### -f 1 -- --cycles-device OPTIX
 test -s /tmp/optix_probe_0001.png
 
-STAGE=smoke     # one 1080p frame of the real scene + the §10.5 numeric gate
+STAGE=smoke     # one 1080p frame of the real scene — [P100 1.1] it must GATE, not just render
+SECONDS=0
 blender -b "$SCRATCH/in/scene.blend" -P render_smoke.py \
         -o "$SCRATCH/out/smoke_####" -f <MID_FRAME> -- --cycles-device OPTIX
-# (render_smoke.py = render_8k.py with 1920×1080 + preview samples; §10.5 gate on the baked proof)
+SMOKE_SEC=$SECONDS
+SMOKE_EXR="$SCRATCH/out/smoke_$(printf '%04d' <MID_FRAME>).exr"
+blender -b --python-expr "import bpy;S=bpy.context.scene;S.view_settings.view_transform='AgX';S.render.image_settings.file_format='PNG';S.render.image_settings.color_depth='16';i=bpy.data.images.load(r'$SMOKE_EXR');i.save_render(r'${SMOKE_EXR%.exr}.png')"
+gate_png "${SMOKE_EXR%.exr}.png" \
+  || { echo "FATAL: smoke frame failed the §10.5 gate — not spending 8K GPU-hours on it"; exit 65; }
+# (render_smoke.py = render_8k.py at 1920×1080 with the SAME quality tier as the hero — a
+#  preview-tier smoke makes the derived ceiling below under-predict; see VOLUME_LOOK_LAW §4)
 
-STAGE=hero
+STAGE=ceiling   # [P100 1.3] smoke has measured a frame — replace the default ceiling with the derived one
+SCALE=16        # 1080p smoke → 8K hero pixel ratio; set 1 if the smoke rendered at 8K
+CEILING_MIN=$(( SMOKE_SEC * SCALE * FRAMES * 3 / 2 / 60 + 5 ))
+sudo shutdown -c
+sudo shutdown -h +$CEILING_MIN "derived dead-man ceiling"
+echo "ceiling re-armed: +${CEILING_MIN} min (smoke ${SMOKE_SEC}s × ${SCALE} × ${FRAMES} frames × 1.5)"
+
+STAGE=hero      # [P100 4.1] a background sampler proves blender actually rendered on the GPU
+nvidia-smi pmon -d 10 -s u > "$SCRATCH/gpu_telemetry.txt" &
+PMON=$!
 blender -b "$SCRATCH/in/scene.blend" -P render_8k.py \
-        -o "$SCRATCH/out/frame_####" -s <START> -e <END> -a \
+        -o "$SCRATCH/out/frame_####" -s $START -e $END -a \
         -- --cycles-device OPTIX --cycles-print-stats
+kill $PMON 2>/dev/null || true
+grep blender "$SCRATCH/gpu_telemetry.txt" | awk '$4+0>0{f=1} END{exit !f}' \
+  || { echo "FATAL: blender never showed GPU utilization (sm% column) — CPU fallback?"; exit 65; }
 
-STAGE=validate  # §10.5: count gate + per-frame numeric gate + NaN check; any failure exits here
-[ "$(ls "$SCRATCH"/out/frame_*.exr | wc -l)" -eq <EXPECTED> ]
+STAGE=validate  # [P100 1.2] count + zero-byte + per-frame NaN + numeric gate — name the first bad frame
+N=$(ls "$SCRATCH"/out/frame_*.exr | wc -l)
+[ "$N" -eq "$FRAMES" ] || { echo "FATAL: frame count $N != $FRAMES"; exit 65; }
+for f in "$SCRATCH"/out/frame_*.exr; do
+  [ -s "$f" ] || { echo "FATAL: zero-byte frame: $f"; exit 65; }
+  oiiotool -a --stats "$f" | awk '/Stats NanCount:/{for(i=3;i<=NF;i++) if($i+0>0) exit 1}' \
+    || { echo "FATAL: NaN pixels in $f"; exit 65; }
+done
+blender -b --python-expr "
+import bpy, glob
+S = bpy.context.scene
+S.view_settings.view_transform = 'AgX'
+S.render.image_settings.file_format = 'PNG'
+S.render.image_settings.color_depth = '16'
+for f in sorted(glob.glob('$SCRATCH/out/frame_*.exr')):
+    img = bpy.data.images.load(f); img.save_render(f[:-4] + '.png'); bpy.data.images.remove(img)
+"   # AgX proofs: the numeric gate's input now, the §7 encode's input later — baked once
+for f in "$SCRATCH"/out/frame_*.png; do
+  gate_png "$f" || { echo "FATAL: frame failed the numeric gate: $f"; exit 65; }
+done
 
 STAGE=upload
 ( cd "$SCRATCH/out" && sha256sum * > checksums.sha256 )
@@ -752,11 +805,14 @@ STAGE=done; echo "JOB COMPLETE"
 ```
 
 Properties that end the never-finishes loop: **fail-closed** (missing cache exits 66 before any
-render), **resumable** (out/ pre-seed + §5 `use_overwrite=False` skip already-finished frames, so
-an interrupted box relaunches and continues), **self-terminating** (the EXIT trap stops the box on
-every path — the shutdown behavior chosen at launch decides stop vs destroy), and **evidenced**
-(log + stage + exit code land in `postmortem/` even on death, so a failed run tells you why without
-a live SSM session).
+render), **gated** (a bad smoke aborts before the 8K spend [P100 1.1]; every hero frame passes the
+NaN + numeric gates by name [P100 1.2]; a render that never touched the GPU fails the telemetry
+gate [P100 4.1]), **cost-bounded** (default ceiling armed immediately, derived ceiling re-armed
+after the smoke [P100 1.3]), **resumable** (out/ pre-seed + §5 `use_overwrite=False` skip
+already-finished frames, so an interrupted box relaunches and continues), **self-terminating** (the
+EXIT trap stops the box on every path — the shutdown behavior chosen at launch decides stop vs
+destroy), and **evidenced** (log + stage + exit code + GPU telemetry land in `postmortem/` even on
+death, so a failed run tells you why without a live SSM session).
 
 ---
 
@@ -865,3 +921,8 @@ Two things remain deliberately out of scope, stated so nobody assumes otherwise:
    headless on a real box, authoring stays a local manual pre-step (Issue 4, path (a) open).
 2. **Preprocessing (raw data → clean volume).** This is a render/farm spec; cleaning, spacing, and
    level normalization of the source volume happen before §1 and are not covered here.
+
+Both — plus everything else between this spec and one proven unattended end-to-end run — are
+planned as gap → deliverable → acceptance in the companion `PATH_TO_100.md`. Its Part 1 (runner
+gates) and 4.1 (GPU-used telemetry) are already implemented in §10.8, marked `[P100 n.n]`; their
+acceptance tests still need to run on the box.
